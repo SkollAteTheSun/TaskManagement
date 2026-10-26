@@ -9,10 +9,14 @@ namespace TaskManagement.Services;
 public class TaskService
 {
     private readonly TaskDbContext _dbContext;
+    private readonly TaskEventQueue _eventQueue;
+    private readonly ILogger<TaskService> _logger;
 
-    public TaskService(TaskDbContext dbContext)
+    public TaskService(TaskDbContext dbContext, TaskEventQueue eventQueue, ILogger<TaskService> logger)
     {
-        _dbContext = dbContext;
+        _dbContext = dbContext ?? throw new ArgumentNullException(nameof(dbContext));
+        _eventQueue = eventQueue ?? throw new ArgumentNullException(nameof(eventQueue));
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
     public async Task<List<TaskItem>> GetAllAsync()
@@ -41,8 +45,8 @@ public class TaskService
         return task;
     }
 
-    // Тут без lock т.к. используем xmin 
-    // xmin предотвратит гонку, эсли будет запущено несколько экземпляров сервиса
+    // используем optimistic concurrency через PostgreSQL xmin.
+    // при одновременном обновлении только один запрос успешно сохранит изменения.
     public async Task<CompleteTaskResult> CompleteAsync(Guid id)
     {
         var task = await _dbContext.Tasks
@@ -60,6 +64,17 @@ public class TaskService
         try
         {
             await _dbContext.SaveChangesAsync();
+
+            var completedEvent = new TaskCompletedEvent(task.Id, task.Title, task.CompletedAt!.Value, task.Priority);
+
+            if (!_eventQueue.Enqueue(completedEvent))
+            {
+                _logger.LogWarning(
+                    "Failed to enqueue task.completed event for {TaskId}",
+                    task.Id);
+            }
+
+            _eventQueue.Enqueue(completedEvent);
             return CompleteTaskResult.Completed;
         }
         catch (DbUpdateConcurrencyException)
@@ -68,7 +83,6 @@ public class TaskService
         }
     }
 
-    //EF Core может выбросить DbUpdateConcurrencyException
     public async Task<bool> DeleteAsync(Guid id)
     {
         var deletedCount = await _dbContext.Tasks
